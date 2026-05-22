@@ -597,7 +597,7 @@ def normalize_response_headers(headers: dict | None) -> tuple[str, dict]:
     return content_type, response_headers
 
 
-async def collect_response_body(current_req_id: str, current_queue: asyncio.Queue, timeout: int = 120) -> str:
+async def collect_response_body(current_req_id: str, current_queue: asyncio.Queue, timeout: int = 300) -> str:
     chunks: list[str] = []
     try:
         while True:
