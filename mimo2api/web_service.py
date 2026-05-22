@@ -167,7 +167,7 @@ from .ui_router import router as ui_router
 app.include_router(ui_router)
 
 RETRYABLE_STATUS_CODES = {401, 403, 429}
-NODE_RESPONSE_TIMEOUT = 30
+NODE_RESPONSE_TIMEOUT = 300
 MAX_RETRIES = 3
 MAX_PENDING_QUEUES = 2000
 AI_ROUTE_PREFIXES = ("/v1/", "/anthropic/v1/")
