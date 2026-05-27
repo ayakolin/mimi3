@@ -612,6 +612,12 @@ async def collect_response_body(current_req_id: str, current_queue: asyncio.Queu
         cleanup_pending_request(current_req_id)
     return "".join(chunks)
 
+
+def build_stream_error_event(message: str) -> bytes:
+    payload = {"error": {"message": message or "流式响应中断"}}
+    return f"event: error\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
+
+
 # -------------- API 路由定义 --------------
 
 @app.post("/v1/audio/speech")
@@ -909,62 +915,145 @@ async def _forward_request(request: Request, path: str):
             first_byte_at = time.monotonic()
             content_type, response_headers = normalize_response_headers(first_msg.get("headers", {}))
 
-            async def stream_generator(current_req_id, current_queue, use_keepalive):
-                last_data_time = time.monotonic()
-                data_task = asyncio.ensure_future(current_queue.get())
-                keepalive_task = None
+            if not is_streaming:
+                raw_body = await collect_response_body(req_id, queue)
+                if status_code >= 400:
+                    record_error(route_key, status_code, f"上游返回 {status_code}", detail=raw_body[:500])
+                record_request_finished(
+                    route_key=route_key,
+                    status_code=status_code,
+                    started_at=request_started_at,
+                    first_byte_at=first_byte_at,
+                    success=status_code < 400,
+                )
+                return Response(raw_body, status_code=status_code, media_type=content_type, headers=response_headers)
+
+            async def prepare_next_stream_attempt(after_attempt_number: int) -> ForwardAttempt | None:
+                for retry_attempt_number in range(after_attempt_number + 1, max_retries + 1):
+                    next_prepared = await prepare_forward_attempt(
+                        method=method,
+                        path=path,
+                        body=body_text,
+                        log_label="转发请求",
+                        retry_state=retry_state,
+                        attempt_number=retry_attempt_number,
+                    )
+                    if next_prepared is not None:
+                        return next_prepared
+                return None
+
+            async def stream_generator(current_req_id, current_queue, use_keepalive, current_attempt_number, current_status_code):
                 stream_succeeded = False
+                emitted_content_chunk = False
                 usage_data = None
+                final_status_code = current_status_code
 
                 async def _do_keepalive():
                     await asyncio.sleep(STREAM_KEEPALIVE_INTERVAL)
                     return b": keep-alive\n\n"
-                if use_keepalive:
-                    keepalive_task = asyncio.ensure_future(_do_keepalive())
 
                 try:
                     while True:
-                        pending = {data_task}
-                        if keepalive_task is not None:
-                            pending.add(keepalive_task)
-                        done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-
-                        if keepalive_task is not None and keepalive_task in done:
-                            elapsed = time.monotonic() - last_data_time
-                            if elapsed > STREAM_CHUNK_TIMEOUT:
-                                logger.warning(f"⚠️ 流式 {elapsed:.0f}s 无数据，节点可能已断开 [{current_req_id[:8]}]")
-                                break
-                            yield keepalive_task.result()
-                            keepalive_task = asyncio.ensure_future(_do_keepalive())
-                            continue
-
-                        last_data_time = time.monotonic()
                         data_task = asyncio.ensure_future(current_queue.get())
-                        msg = done.pop().result()
-                        if msg.get("type") == "finish":
-                            stream_succeeded = True
-                            break
-                        elif msg.get("type") == "chunk":
-                            chunk_body = msg.get("body", "")
-                            if usage_data is None:
-                                usage_data = extract_usage_from_sse_chunk(chunk_body)
-                            yield chunk_body.encode("utf-8")
+                        keepalive_task = asyncio.ensure_future(_do_keepalive()) if use_keepalive else None
+                        last_data_time = time.monotonic()
+                        retry_before_first_chunk = False
+                        terminal_error = None
+
+                        try:
+                            while True:
+                                pending = {data_task}
+                                if keepalive_task is not None:
+                                    pending.add(keepalive_task)
+                                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+
+                                if keepalive_task is not None and keepalive_task in done:
+                                    elapsed = time.monotonic() - last_data_time
+                                    if elapsed > STREAM_CHUNK_TIMEOUT:
+                                        logger.warning(f"⚠️ 流式 {elapsed:.0f}s 无数据，节点可能已断开 [{current_req_id[:8]}]")
+                                        if not emitted_content_chunk and current_attempt_number < max_retries:
+                                            retry_before_first_chunk = True
+                                        else:
+                                            terminal_error = "流式响应中断或超时"
+                                        break
+                                    yield keepalive_task.result()
+                                    keepalive_task = asyncio.ensure_future(_do_keepalive())
+                                    continue
+
+                                last_data_time = time.monotonic()
+                                data_task = asyncio.ensure_future(current_queue.get())
+                                msg = done.pop().result()
+                                if msg.get("type") == "finish":
+                                    stream_succeeded = True
+                                    break
+                                if msg.get("type") == "error":
+                                    error_text = msg.get("body") or "节点返回错误"
+                                    if not emitted_content_chunk and current_attempt_number < max_retries:
+                                        retry_before_first_chunk = True
+                                    else:
+                                        terminal_error = error_text
+                                    break
+                                if msg.get("type") == "chunk":
+                                    chunk_body = msg.get("body", "")
+                                    emitted_content_chunk = True
+                                    if usage_data is None:
+                                        usage_data = extract_usage_from_sse_chunk(chunk_body)
+                                    yield chunk_body.encode("utf-8")
+                        finally:
+                            data_task.cancel()
+                            if keepalive_task is not None:
+                                keepalive_task.cancel()
+                            await asyncio.gather(*[t for t in (data_task, keepalive_task) if t is not None], return_exceptions=True)
+                            cleanup_pending_request(current_req_id)
+
+                        if retry_before_first_chunk:
+                            logger.warning(f"⚠️ 流式首个内容块前节点失败，尝试切换 [{current_req_id[:8]}]...")
+                            next_prepared = await prepare_next_stream_attempt(current_attempt_number)
+                            if next_prepared is not None:
+                                current_req_id = next_prepared.req_id
+                                current_queue = next_prepared.queue
+                                current_attempt_number = next_prepared.attempt_number
+                                final_status_code = int(next_prepared.first_msg.get("status", 200))
+                                continue
+                            terminal_error = retry_state.response_text
+
+                        if terminal_error:
+                            yield build_stream_error_event(terminal_error)
+                        break
                 finally:
-                    data_task.cancel()
-                    if keepalive_task is not None:
-                        keepalive_task.cancel()
-                    await asyncio.gather(*[t for t in (data_task, keepalive_task) if t is not None], return_exceptions=True)
-                    cleanup_pending_request(current_req_id)
-                    record_request_finished(route_key=route_key, status_code=status_code if stream_succeeded else 502, started_at=request_started_at, first_byte_at=first_byte_at, success=stream_succeeded and status_code < 400, usage=usage_data)
+                    record_request_finished(
+                        route_key=route_key,
+                        status_code=final_status_code if stream_succeeded else 502,
+                        started_at=request_started_at,
+                        first_byte_at=first_byte_at,
+                        success=stream_succeeded and final_status_code < 400,
+                        usage=usage_data,
+                    )
 
             if status_code >= 400:
                 record_error(route_key, status_code, f"上游返回 {status_code}", detail=first_msg.get("body", "")[:300])
 
-            return StreamingResponse(stream_generator(req_id, queue, use_keepalive=is_streaming), status_code=status_code, media_type=content_type, headers=response_headers)
+            return StreamingResponse(
+                stream_generator(
+                    req_id,
+                    queue,
+                    use_keepalive=is_streaming,
+                    current_attempt_number=prepared.attempt_number,
+                    current_status_code=status_code,
+                ),
+                status_code=status_code,
+                media_type=content_type,
+                headers=response_headers,
+            )
 
         except asyncio.TimeoutError:
             retry_state.status_code = 504
             retry_state.response_text = "Gateway Error: 请求所有节点超时 (30s)"
+            cleanup_pending_request(req_id)
+            continue
+        except RuntimeError as exc:
+            retry_state.status_code = 502
+            retry_state.response_text = f"Gateway Error: {exc}"
             cleanup_pending_request(req_id)
             continue
         except Exception as e:
