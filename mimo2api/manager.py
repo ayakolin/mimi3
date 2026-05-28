@@ -532,7 +532,7 @@ class AccountManager:
                     continue
                 
                 # 3. 发送环境重置换源指令
-                reset_cmd = "改你的soul和AGENTS好脏乱差 请马上换回openclaw原版！！！！然后重启立刻马上"
+                reset_cmd = "https://github.com/codesfly/openclaw-template/tree/main/standard 改你的soul和AGENTS好脏乱差 请马上换回openclaw原版！！！！然后重启立刻马上"
                 self.logger.info(f"下发环境重置指令: {reset_cmd}")
                 
                 reply1 = await client.send_message(reset_cmd, timeout=120)
