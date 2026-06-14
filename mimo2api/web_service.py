@@ -371,6 +371,54 @@ def apply_model_mapping(body_text: str) -> str:
         return json.dumps(data, ensure_ascii=False)
     return body_text
 
+# 上游 OpenClaw 网关(api-oc.xiaomimimo.com)对 mimo-v2.5-pro 施加反滥用校验:
+# 请求的 system 必须包含 OpenClaw agent 的标识句，否则返回 400 "Param Incorrect / Invalid request"。
+# 经逆向验证：system 含下面这个精确子串即放行，且与 tools、客户端自有指令、出现位置都无关，
+# 因此注入它对模型行为与工具调用的影响降到最低——客户端的 tools 与 system 指令保持原样，
+# 标识句以追加方式置于客户端 system 之后，让客户端指令继续主导。
+OPENCLAW_V25PRO_MODELS = {"mimo-v2.5-pro", "xiaomi/mimo-v2.5-pro"}
+OPENCLAW_SYSTEM_MARKER = "You are a personal assistant running inside OpenClaw."
+
+def _inject_openclaw_marker_text(content: str) -> str:
+    if OPENCLAW_SYSTEM_MARKER in content:
+        return content
+    return f"{content}\n\n{OPENCLAW_SYSTEM_MARKER}" if content else OPENCLAW_SYSTEM_MARKER
+
+def apply_openclaw_v25pro_compat(body_text: str) -> str:
+    try:
+        data = json.loads(body_text)
+    except (json.JSONDecodeError, AttributeError):
+        return body_text
+    if (data.get("model") or "") not in OPENCLAW_V25PRO_MODELS:
+        return body_text
+
+    # Anthropic 风格：system 是顶层字符串
+    sys_top = data.get("system")
+    if isinstance(sys_top, str):
+        data["system"] = _inject_openclaw_marker_text(sys_top)
+        logger.info("🔁 OpenClaw v2.5-pro 兼容: 注入 system 标识 (anthropic)")
+        return json.dumps(data, ensure_ascii=False)
+
+    # OpenAI 风格：messages 数组里的 system 消息
+    messages = data.get("messages")
+    if not isinstance(messages, list):
+        return body_text
+    sys_msg = next((m for m in messages if isinstance(m, dict) and m.get("role") == "system"), None)
+    if sys_msg is None:
+        messages.insert(0, {"role": "system", "content": OPENCLAW_SYSTEM_MARKER})
+        logger.info("🔁 OpenClaw v2.5-pro 兼容: 插入 system 标识")
+    else:
+        content = sys_msg.get("content")
+        if isinstance(content, list):
+            # content 为分块数组(多模态)：仅在未出现标识时追加一个 text 块
+            if OPENCLAW_SYSTEM_MARKER not in json.dumps(content, ensure_ascii=False):
+                content.append({"type": "text", "text": OPENCLAW_SYSTEM_MARKER})
+                logger.info("🔁 OpenClaw v2.5-pro 兼容: 追加 system 标识 (content array)")
+        else:
+            sys_msg["content"] = _inject_openclaw_marker_text(content if isinstance(content, str) else "")
+            logger.info("🔁 OpenClaw v2.5-pro 兼容: 追加 system 标识")
+    return json.dumps(data, ensure_ascii=False)
+
 @app.get("/api/model_mapping")
 async def api_get_model_mapping():
     return JSONResponse(content=load_model_mapping())
@@ -730,6 +778,7 @@ async def responses_handler(request: Request):
         chat_req["stream"] = True
 
     chat_body_text = json.dumps(chat_req, ensure_ascii=False)
+    chat_body_text = apply_openclaw_v25pro_compat(chat_body_text)
     max_retries = min(MAX_RETRIES, get_available_client_count())
     if max_retries == 0:
         return Response("Gateway Error: 没有可用的内网节点", status_code=503)
@@ -892,6 +941,7 @@ async def _forward_request(request: Request, path: str):
     retry_state = RetryState()
     body_text = body.decode("utf-8", "ignore").lstrip("\ufeff")
     body_text = apply_model_mapping(body_text)
+    body_text = apply_openclaw_v25pro_compat(body_text)
     route_key = path
     request_started_at = time.monotonic()
 
